@@ -197,6 +197,43 @@ func (i *TTMLInItems) UnmarshalXML(d *xml.Decoder, start xml.StartElement) (err 
 	return nil
 }
 
+type ttmlXmlTokenReader struct {
+	xmlTokenReader xml.TokenReader
+	holdingToken   xml.Token
+}
+
+// Token implements the TokenReader interface, when it meets the "br" tag, it will hold the token and return a newline
+// instead. This is to work around the fact that the go xml unmarshaler will ignore the "br" tag if it's within a
+// character data field.
+func (r *ttmlXmlTokenReader) Token() (xml.Token, error) {
+	if r.holdingToken != nil {
+		returnToken := r.holdingToken
+		r.holdingToken = nil
+		return returnToken, nil
+	}
+
+	t, err := r.xmlTokenReader.Token()
+	if err != nil {
+		return nil, err
+	}
+
+	if se, ok := t.(xml.StartElement); ok && strings.ToLower(se.Name.Local) == "br" {
+		r.holdingToken = t
+		return xml.CharData("\n"), nil
+	}
+
+	return t, nil
+}
+
+func newTTMLXmlDecoder(ts TTMLInSubtitle) *xml.Decoder {
+	return xml.NewTokenDecoder(
+		&ttmlXmlTokenReader{
+			xmlTokenReader: xml.NewDecoder(strings.NewReader("<p>" + ts.Items + "</p>")),
+			holdingToken:   nil,
+		},
+	)
+}
+
 // TTMLInItem represents an input TTML item
 type TTMLInItem struct {
 	Style string `xml:"style,attr,omitempty"`
@@ -380,7 +417,7 @@ func ReadFromTTML(i io.Reader) (o *Subtitles, err error) {
 
 		// Unmarshal items
 		var items = TTMLInItems{}
-		if err = xml.Unmarshal([]byte("<span>"+ts.Items+"</span>"), &items); err != nil {
+		if err = newTTMLXmlDecoder(ts).Decode(&items); err != nil {
 			err = fmt.Errorf("astisub: unmarshaling items failed: %w", err)
 			return
 		}
@@ -559,8 +596,29 @@ func (t TTMLOutDuration) MarshalText() ([]byte, error) {
 	return []byte(formatDuration(time.Duration(t), ".", 3)), nil
 }
 
+// WriteToTTMLOptions represents TTML write options.
+type WriteToTTMLOptions struct {
+	Indent string // Default is 4 spaces.
+}
+
+// WriteToTTMLOption represents a WriteToTTML option.
+type WriteToTTMLOption func(o *WriteToTTMLOptions)
+
+// WriteToTTMLWithIndentOption sets the indent option.
+func WriteToTTMLWithIndentOption(indent string) WriteToTTMLOption {
+	return func(o *WriteToTTMLOptions) {
+		o.Indent = indent
+	}
+}
+
 // WriteToTTML writes subtitles in .ttml format
-func (s Subtitles) WriteToTTML(o io.Writer) (err error) {
+func (s Subtitles) WriteToTTML(o io.Writer, opts ...WriteToTTMLOption) (err error) {
+	// Create write options
+	wo := &WriteToTTMLOptions{Indent: "    "}
+	for _, opt := range opts {
+		opt(wo)
+	}
+
 	// Do not write anything if no subtitles
 	if len(s.Items) == 0 {
 		return ErrNoSubtitlesToWrite
@@ -677,7 +735,10 @@ func (s Subtitles) WriteToTTML(o io.Writer) (err error) {
 
 	// Marshal XML
 	var e = xml.NewEncoder(o)
-	e.Indent("", "    ")
+
+	// Set indent
+	e.Indent("", wo.Indent)
+
 	if err = e.Encode(ttml); err != nil {
 		err = fmt.Errorf("astisub: xml encoding failed: %w", err)
 		return
